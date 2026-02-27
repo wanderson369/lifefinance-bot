@@ -604,4 +604,639 @@ def abrir_trade_demo(demo, sinal):
         "forca":       sinal["forca"],
         "horario":     agora_brt(),
         "data":        str(date.today()),
-        "stat
+        "status":      "ABERTO",
+        "pl_pips":     0,
+        "pl_usd":      0,
+    }
+
+    demo["trades_abertos"][trade_id] = trade
+    demo["trades_hoje"]  += 1
+    demo["total_trades"] += 1
+    salvar_demo(demo)
+
+    msg = (
+        f"TRADE DEMO ABERTO\n"
+        f"-----------------------\n"
+        f"Par:     {par}\n"
+        f"TF:      {tf.upper()}\n"
+        f"Direcao: {direcao}\n"
+        f"Entrada: {preco:.5f}\n"
+        f"SL:      {sl_preco:.5f} ({pips['sl']} pips)\n"
+        f"TP:      {tp_preco:.5f} ({pips['tp']} pips)\n"
+        f"BE em:   {pips['be']} pips de lucro\n"
+        f"Lote:    {lote}\n"
+        f"Prob:    {sinal['prob']}%\n"
+        f"Saldo:   ${demo['saldo_atual']:.2f}\n"
+        f"Trades hoje: {demo['trades_hoje']}/{demo['max_trades_dia']}\n"
+        f"Horario: {agora_brt()}"
+    )
+    return demo, msg
+
+def fechar_trade_demo(demo, trade_id, preco_saida, motivo="Manual"):
+    """Fecha um trade e registra resultado"""
+    if trade_id not in demo["trades_abertos"]:
+        return demo, "Trade nao encontrado."
+
+    trade   = demo["trades_abertos"][trade_id]
+    par     = trade["par"]
+    direcao = trade["direcao"]
+    entry   = trade["preco_entry"]
+    ps      = pip_size(par)
+    lote    = trade["lote"]
+
+    if direcao == "COMPRA":
+        pl_pips = (preco_saida - entry) / ps
+    else:
+        pl_pips = (entry - preco_saida) / ps
+
+    pl_usd = round(pl_pips * ps * lote * 100000, 2)
+
+    trade["preco_saida"] = preco_saida
+    trade["pl_pips"]     = round(pl_pips, 1)
+    trade["pl_usd"]      = pl_usd
+    trade["motivo"]      = motivo
+    trade["horario_fechamento"] = agora_brt()
+
+    if pl_pips > 0:
+        trade["status"] = "GANHO"
+        demo["ganhos"] += 1
+    elif pl_pips == 0:
+        trade["status"] = "BREAKEVEN"
+        demo["breakevens"] += 1
+    else:
+        trade["status"] = "PERDA"
+        demo["perdas"] += 1
+
+    demo["saldo_atual"] = round(demo["saldo_atual"] + pl_usd, 2)
+    demo["historico"].append(trade)
+    del demo["trades_abertos"][trade_id]
+    salvar_demo(demo)
+
+    sinal_pl = "+" if pl_pips >= 0 else ""
+    emoji    = "GANHO" if pl_pips > 0 else "BREAKEVEN" if pl_pips == 0 else "PERDA"
+
+    msg = (
+        f"{emoji} TRADE FECHADO\n"
+        f"-----------------------\n"
+        f"Par:     {par}\n"
+        f"Direcao: {direcao}\n"
+        f"Entrada: {entry:.5f}\n"
+        f"Saida:   {preco_saida:.5f}\n"
+        f"P/L:     {sinal_pl}{pl_pips:.1f} pips | {sinal_pl}${pl_usd:.2f}\n"
+        f"Motivo:  {motivo}\n"
+        f"-----------------------\n"
+        f"Saldo:   ${demo['saldo_atual']:.2f}\n"
+        f"Horario: {agora_brt()}"
+    )
+    return demo, msg
+
+def monitorar_trades_demo(demo):
+    """Monitora trades abertos - verifica BE, SL, TP"""
+    if not demo["trades_abertos"]: return demo, []
+    mensagens = []
+
+    for tid, trade in list(demo["trades_abertos"].items()):
+        par     = trade["par"]
+        direcao = trade["direcao"]
+        ps      = pip_size(par)
+
+        # Buscar preco atual
+        try:
+            r = requests.get("https://api.twelvedata.com/price",
+                params={"symbol":par,"apikey":TWELVE_API_KEY}, timeout=4)
+            preco_atual = float(r.json().get("price", 0))
+        except: continue
+
+        if not preco_atual: continue
+
+        if direcao == "COMPRA":
+            pl_pips = (preco_atual - trade["preco_entry"]) / ps
+        else:
+            pl_pips = (trade["preco_entry"] - preco_atual) / ps
+
+        trade["pl_pips"] = round(pl_pips, 1)
+        trade["pl_usd"]  = round(pl_pips * ps * trade["lote"] * 100000, 2)
+
+        # Verificar Breakeven
+        if not trade["be_movido"] and pl_pips >= trade["pips_be"]:
+            trade["be_movido"] = True
+            trade["sl"]        = trade["preco_entry"]
+            mensagens.append(
+                f"BREAKEVEN {par}\n"
+                f"SL movido para entrada: {trade['preco_entry']:.5f}\n"
+                f"Lucro atual: +{pl_pips:.1f} pips")
+
+        # Verificar TP atingido
+        if direcao == "COMPRA" and preco_atual >= trade["tp"]:
+            demo, msg = fechar_trade_demo(demo, tid, trade["tp"], "TP atingido")
+            mensagens.append(msg)
+        elif direcao == "VENDA" and preco_atual <= trade["tp"]:
+            demo, msg = fechar_trade_demo(demo, tid, trade["tp"], "TP atingido")
+            mensagens.append(msg)
+
+        # Verificar SL atingido
+        elif direcao == "COMPRA" and preco_atual <= trade["sl"]:
+            demo, msg = fechar_trade_demo(demo, tid, trade["sl"], "SL atingido")
+            mensagens.append(msg)
+        elif direcao == "VENDA" and preco_atual >= trade["sl"]:
+            demo, msg = fechar_trade_demo(demo, tid, trade["sl"], "SL atingido")
+            mensagens.append(msg)
+
+    salvar_demo(demo)
+    return demo, mensagens
+
+# ============================================================
+# CALENDARIO ECONOMICO
+# ============================================================
+def buscar_noticias_impacto():
+    """Busca noticias de alto impacto (2-3 cabecas) do ForexFactory via scraping simples"""
+    noticias = []
+    try:
+        hoje = datetime.now(timezone.utc).strftime("%b%d.%Y").lower()
+        r = requests.get(
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200: return []
+        dados = r.json()
+        agora_utc = datetime.now(timezone.utc)
+
+        for evento in dados:
+            impacto = evento.get("impact", "")
+            if impacto not in ["High", "Medium"]: continue
+            if impacto == "Medium": continue  # so High = 3 cabecas
+
+            try:
+                dt_str = evento.get("date", "") + " " + evento.get("time", "")
+                dt_evt = datetime.strptime(dt_str, "%Y-%m-%d %I:%M%p")
+                dt_evt = dt_evt.replace(tzinfo=timezone.utc)
+            except: continue
+
+            diff_min = (dt_evt - agora_utc).total_seconds() / 60
+
+            # Janela: 10min antes ate 40min depois
+            if -40 <= diff_min <= 10:
+                noticias.append({
+                    "titulo":   evento.get("title", ""),
+                    "moeda":    evento.get("country", ""),
+                    "impacto":  impacto,
+                    "minutos":  round(diff_min, 0),
+                    "horario":  dt_evt.astimezone(BRT).strftime("%H:%M"),
+                })
+    except Exception as e:
+        print(f"Erro calendario: {e}")
+    return noticias
+
+def par_afetado_por_noticia(par, noticias):
+    """Verifica se um par e afetado por noticia de alto impacto"""
+    moedas_par = par.replace("/","").replace("USDT","USD")
+    for n in noticias:
+        moeda = n["moeda"].upper()
+        if moeda in moedas_par:
+            return True, n
+    return False, None
+
+# ============================================================
+# ESTATISTICAS
+# ============================================================
+def calc_stats(historico, filtro_periodo=None):
+    """Calcula estatisticas do historico de trades"""
+    if filtro_periodo:
+        hoje = date.today()
+        if filtro_periodo == "dia":
+            h = [t for t in historico if t.get("data") == str(hoje)]
+        elif filtro_periodo == "semana":
+            inicio_sem = hoje - timedelta(days=hoje.weekday())
+            h = [t for t in historico if t.get("data","") >= str(inicio_sem)]
+        elif filtro_periodo == "mes":
+            h = [t for t in historico if t.get("data","")[:7] == str(hoje)[:7]]
+        else:
+            h = historico
+    else:
+        h = historico
+
+    if not h: return None
+
+    total    = len(h)
+    ganhos   = len([t for t in h if t["status"] == "GANHO"])
+    perdas   = len([t for t in h if t["status"] == "PERDA"])
+    bes      = len([t for t in h if t["status"] == "BREAKEVEN"])
+    taxa     = round(ganhos/total*100, 1) if total > 0 else 0
+    pl_total = round(sum(t.get("pl_usd", 0) for t in h), 2)
+    pl_pips  = round(sum(t.get("pl_pips", 0) for t in h), 1)
+
+    # Por par
+    por_par = {}
+    for t in h:
+        par = t["par"]
+        if par not in por_par:
+            por_par[par] = {"total":0,"ganhos":0,"pl_pips":0,"pl_usd":0}
+        por_par[par]["total"]   += 1
+        por_par[par]["pl_pips"] += t.get("pl_pips", 0)
+        por_par[par]["pl_usd"]  += t.get("pl_usd", 0)
+        if t["status"] == "GANHO": por_par[par]["ganhos"] += 1
+
+    # Por TF
+    por_tf = {}
+    for t in h:
+        tf = t.get("tf","?")
+        if tf not in por_tf:
+            por_tf[tf] = {"total":0,"ganhos":0,"pl_pips":0}
+        por_tf[tf]["total"]   += 1
+        por_tf[tf]["pl_pips"] += t.get("pl_pips", 0)
+        if t["status"] == "GANHO": por_tf[tf]["ganhos"] += 1
+
+    # Par mais obediente (maior taxa de acerto com min 3 trades)
+    melhor_par = max(
+        [(p, d["ganhos"]/d["total"]*100) for p,d in por_par.items() if d["total"] >= 3],
+        key=lambda x: x[1], default=("N/A", 0))
+
+    return {
+        "total": total, "ganhos": ganhos, "perdas": perdas, "bes": bes,
+        "taxa": taxa, "pl_total": pl_total, "pl_pips": pl_pips,
+        "por_par": por_par, "por_tf": por_tf,
+        "melhor_par": melhor_par,
+    }
+
+def formatar_stats(stats, titulo="Estatisticas"):
+    if not stats: return f"{titulo}: Sem dados ainda."
+
+    linhas = [
+        f"{titulo}\n-----------------------",
+        f"Total:    {stats['total']} trades",
+        f"Ganhos:   {stats['ganhos']}",
+        f"Perdas:   {stats['perdas']}",
+        f"Breakeven:{stats['bes']}",
+        f"Taxa:     {stats['taxa']}%",
+        f"P/L Pips: {'+' if stats['pl_pips']>=0 else ''}{stats['pl_pips']}",
+        f"P/L USD:  {'+' if stats['pl_total']>=0 else ''}${stats['pl_total']:.2f}",
+        f"-----------------------",
+        f"Melhor par: {stats['melhor_par'][0]} ({stats['melhor_par'][1]:.0f}%)",
+        f"-----------------------",
+        "Por Par:",
+    ]
+    for par, d in sorted(stats["por_par"].items(),
+                         key=lambda x: x[1]["pl_pips"], reverse=True):
+        tx = round(d["ganhos"]/d["total"]*100) if d["total"] > 0 else 0
+        sinal = "+" if d["pl_pips"] >= 0 else ""
+        linhas.append(
+            f"  {par}: {d['total']}t {tx}% "
+            f"{sinal}{d['pl_pips']:.0f}p "
+            f"{sinal}${d['pl_usd']:.2f}")
+
+    linhas.append("-----------------------\nPor TF:")
+    for tf, d in sorted(stats["por_tf"].items(),
+                        key=lambda x: x[1]["pl_pips"], reverse=True):
+        tx = round(d["ganhos"]/d["total"]*100) if d["total"] > 0 else 0
+        sinal = "+" if d["pl_pips"] >= 0 else ""
+        linhas.append(
+            f"  {tf.upper()}: {d['total']}t {tx}% "
+            f"{sinal}{d['pl_pips']:.0f}p")
+
+    return "\n".join(linhas)
+
+def processar_comandos():
+    for u in buscar_updates():
+        msg   = u.get("message", {})
+        texto = msg.get("text", "").strip()
+        cid   = str(msg.get("chat", {}).get("id", ""))
+        if not texto.startswith("/"): continue
+        partes = texto.split(maxsplit=1)
+        cmd    = partes[0].lower().split("@")[0]
+        arg    = partes[1].strip().upper() if len(partes) > 1 else ""
+
+        if cmd == "/start":
+            enviar(
+                "LIFEFINANCE BOT v2.0\n"
+                "-----------------------\n"
+                "Analise MultiTimeframe\n"
+                "M5 . M15 . M30 . H1 . H4\n"
+                "EMA9/21 SMA50 RSI Stoch MACD\n"
+                "-----------------------\n"
+                "1 TF confluente   = 80%\n"
+                "1 TF + forca      = 85%\n"
+                "M5+M30 ou M5+H1   = 90%\n"
+                "M15+H4            = 90%\n"
+                "TODOS os TFs      = 95%\n"
+                "-----------------------\n"
+                "RSI>80 ou <20 = ATENCAO!\n\n"
+                "/ajuda para ver comandos", cid)
+
+        elif cmd == "/status":
+            enviar(
+                f"Status LifeFinance Bot v2.0\n"
+                f"-----------------------\n"
+                f"Estado : {'Pausado' if CONFIG['pausado'] else 'Ativo'}\n"
+                f"Online : {inicio}\n"
+                f"Sinais : {total_sinais}\n"
+                f"TFs    : M5 M15 M30 H1 H4\n"
+                f"MACD   : 20,36,10\n"
+                f"Prob   : >={CONFIG['prob_minima']}%\n"
+                f"Hora   : {agora_brt()}", cid)
+
+        elif cmd == "/sinais":
+            if not historico_sinais:
+                enviar("Nenhum sinal ainda.", cid)
+            else:
+                linhas = ["Ultimos Sinais LF v2.0\n"]
+                for s in list(reversed(list(historico_sinais)))[:10]:
+                    d = ">" if s["direcao"] == "COMPRA" else "<"
+                    linhas.append(
+                        f"{d} {s['par']} {s['prob']}% "
+                        f"{'F' if s['forca'] else ''} "
+                        f"TFs:{s['n_tfs']} "
+                        f"{converter_hora(s['horario'])}")
+                enviar("\n".join(linhas), cid)
+
+        elif cmd == "/filtrar":
+            if arg in ["COMPRA", "VENDA"]:
+                CONFIG["filtro_direcao"] = arg
+                enviar(f"Filtro: so {arg}", cid)
+            elif arg.isdigit() and 80 <= int(arg) <= 95:
+                CONFIG["filtro_prob"] = int(arg)
+                enviar(f"Filtro: prob >= {arg}%", cid)
+            else:
+                enviar("Use: /filtrar COMPRA | VENDA | 85 | 90 | 95", cid)
+
+        elif cmd == "/limpar":
+            CONFIG["filtro_direcao"] = ""
+            CONFIG["filtro_prob"]    = CONFIG["prob_minima"]
+            enviar("Filtros limpos!", cid)
+
+        elif cmd == "/pausar":
+            CONFIG["pausado"] = True; enviar("Pausado.", cid)
+
+        elif cmd == "/retomar":
+            CONFIG["pausado"] = False; enviar("Reativado!", cid)
+
+        elif cmd == "/ajuda":
+            enviar(
+                "Comandos LifeFinance v2.0\n"
+                "-----------------------\n"
+                "SINAIS:\n"
+                "/status /sinais /filtrar\n"
+                "/limpar /pausar /retomar\n"
+                "-----------------------\n"
+                "CONTA DEMO:\n"
+                "/novademo X -> criar ($X)\n"
+                "/demo -> saldo\n"
+                "/abertos -> trades abertos\n"
+                "/noticias -> calendario\n"
+                "-----------------------\n"
+                "HISTORICO:\n"
+                "/historico dia|semana|mes\n"
+                "-----------------------\n"
+                "ESTATISTICAS:\n"
+                "/stats dia|semana|mes\n"
+                "/melhor -> ranking pares\n"
+                "/resetdemo -> zerar", cid)
+        # COMANDOS DEMO
+        elif cmd == "/novademo":
+            try:
+                saldo = float(arg) if arg else 50.0
+                saldo = max(10.0, min(saldo, 10000.0))
+            except: saldo = 50.0
+            demo = criar_demo(saldo)
+            enviar(
+                "Conta Demo criada!\n"
+                "-----------------------\n"
+                f"Saldo: ${saldo:.2f}\n"
+                "Risco: 2% por trade\n"
+                "Max:   3 trades/dia\n"
+                "Calendario: ATIVO\n"
+                "-----------------------\n"
+                "Bot opera automaticamente!\n\n"
+                "/demo para ver saldo", cid)
+
+        elif cmd == "/demo":
+            demo = carregar_demo()
+            if not demo:
+                enviar("Nenhuma conta demo.\nUse /novademo para criar.", cid)
+            else:
+                pl = round(demo["saldo_atual"] - demo["saldo_inicial"], 2)
+                sp = "+" if pl >= 0 else ""
+                demo = resetar_trades_dia(demo)
+                linhas = [
+                    "Conta Demo LF",
+                    "-----------------------",
+                    f"Saldo inicial: ${demo['saldo_inicial']:.2f}",
+                    f"Saldo atual:   ${demo['saldo_atual']:.2f}",
+                    f"P/L total:     {sp}${pl:.2f}",
+                    "-----------------------",
+                    f"Total trades:  {demo['total_trades']}",
+                    f"Ganhos:        {demo['ganhos']}",
+                    f"Perdas:        {demo['perdas']}",
+                    f"Breakevens:    {demo['breakevens']}",
+                    "-----------------------",
+                    f"Abertos:       {len(demo['trades_abertos'])}",
+                    f"Trades hoje:   {demo['trades_hoje']}/{demo['max_trades_dia']}",
+                    f"Criado em:     {demo['criado_em']}",
+                ]
+                enviar("\n".join(linhas), cid)
+
+        elif cmd == "/abertos":
+            demo = carregar_demo()
+            if not demo or not demo["trades_abertos"]:
+                enviar("Nenhum trade aberto.", cid)
+            else:
+                n = len(demo["trades_abertos"])
+                linhas = [f"Trades Abertos ({n})"]
+                for tid, t in demo["trades_abertos"].items():
+                    sp = "+" if t["pl_pips"] >= 0 else ""
+                    be_txt = "Movido" if t["be_movido"] else f"em {t['pips_be']}p"
+                    linhas.append(
+                        f"{t['direcao']} {t['par']} {t['tf'].upper()}\n"
+                        f"  Entry:{t['preco_entry']:.5f} SL:{t['sl']:.5f} TP:{t['tp']:.5f}\n"
+                        f"  P/L: {sp}{t['pl_pips']:.1f}p | {sp}${t['pl_usd']:.2f}\n"
+                        f"  BE: {be_txt} | {t['horario']}")
+                enviar("\n".join(linhas), cid)
+
+        elif cmd == "/historico":
+            demo = carregar_demo()
+            if not demo or not demo["historico"]:
+                enviar("Nenhum trade fechado ainda.", cid)
+            else:
+                periodo = arg.lower() if arg else ""
+                hoje = date.today()
+                if periodo == "dia":
+                    h = [t for t in demo["historico"] if t.get("data") == str(hoje)]
+                    titulo = "Hoje"
+                elif periodo == "semana":
+                    ini = hoje - timedelta(days=hoje.weekday())
+                    h = [t for t in demo["historico"] if t.get("data","") >= str(ini)]
+                    titulo = "Esta Semana"
+                elif periodo == "mes":
+                    h = [t for t in demo["historico"] if t.get("data","")[:7] == str(hoje)[:7]]
+                    titulo = "Este Mes"
+                else:
+                    h = list(reversed(demo["historico"]))[:15]
+                    titulo = f"Ultimos {len(h)}"
+                if not h:
+                    enviar(f"Sem trades em {titulo}.", cid)
+                else:
+                    linhas = [f"Historico {titulo} ({len(h)} trades)"]
+                    for t in h:
+                        e = "+" if t["status"]=="GANHO" else "=" if t["status"]=="BREAKEVEN" else "-"
+                        sp = "+" if t["pl_pips"] >= 0 else ""
+                        linhas.append(
+                            f"{e} {t['direcao']} {t['par']} {t.get('tf','?').upper()} "
+                            f"{sp}{t['pl_pips']:.1f}p ${sp}{t['pl_usd']:.2f} "
+                            f"{t.get('motivo','?')} {t['horario']}")
+                    enviar("\n".join(linhas), cid)
+
+        elif cmd == "/stats":
+            demo = carregar_demo()
+            if not demo or not demo["historico"]:
+                enviar("Sem historico ainda.", cid)
+            else:
+                periodo = arg.lower() if arg else "total"
+                p = periodo if periodo in ["dia","semana","mes"] else None
+                titulo = {"dia":"Hoje","semana":"Semana","mes":"Mes"}.get(periodo,"Total")
+                stats = calc_stats(demo["historico"], p)
+                enviar(formatar_stats(stats, f"Stats {titulo}"), cid)
+
+        elif cmd == "/melhor":
+            demo = carregar_demo()
+            if not demo or not demo["historico"]:
+                enviar("Sem dados ainda.", cid)
+            else:
+                stats = calc_stats(demo["historico"])
+                if not stats:
+                    enviar("Sem dados suficientes.", cid)
+                else:
+                    linhas = ["Ranking Pares", "(min 3 trades por par)", ""]
+                    ranking = [(p, d) for p,d in stats["por_par"].items() if d["total"] >= 3]
+                    ranking.sort(key=lambda x: x[1]["ganhos"]/x[1]["total"], reverse=True)
+                    for i, (par, d) in enumerate(ranking[:10], 1):
+                        tx = round(d["ganhos"]/d["total"]*100)
+                        sp = "+" if d["pl_pips"] >= 0 else ""
+                        linhas.append(f"{i}. {par}: {tx}% ({d['ganhos']}/{d['total']}) {sp}{d['pl_pips']:.0f}p")
+                    if not ranking:
+                        linhas.append("Precisa 3+ trades por par")
+                    enviar("\n".join(linhas), cid)
+
+        elif cmd == "/noticias":
+            noticias = buscar_noticias_impacto()
+            if not noticias:
+                enviar("Nenhuma noticia alto impacto agora.\nMercado livre!", cid)
+            else:
+                linhas = ["Noticias Alto Impacto", "(10min antes / 40min depois)", ""]
+                for n in noticias:
+                    sinal = "+" if n["minutos"] > 0 else "-"
+                    quando = f"em {abs(n['minutos']):.0f}min" if n["minutos"] > 0 else f"ha {abs(n['minutos']):.0f}min"
+                    linhas.append(f"BLOQUEADO {n['moeda']} {quando}\n  {n['titulo']} {n['horario']}")
+                enviar("\n".join(linhas), cid)
+
+        elif cmd == "/resetdemo":
+            demo = criar_demo(50.0)
+            enviar("Demo resetada! Saldo: $50.00", cid)
+
+def deve_verificar(par):
+    """Verifica a cada 15min (menor TF do scan MTF)"""
+    agora = time.time()
+    if agora - ultima_verificacao.get(par, 0) >= 900:
+        ultima_verificacao[par] = agora
+        return True
+    return False
+
+def passar_filtros(s):
+    if CONFIG["filtro_pares"]   and s["par"] not in CONFIG["filtro_pares"]:   return False
+    if CONFIG["filtro_direcao"] and s["direcao"] != CONFIG["filtro_direcao"]: return False
+    if s["prob"] < CONFIG["filtro_prob"]: return False
+    return True
+
+class PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b"LifeFinance Bot v2.0 Online")
+    def log_message(self, *a): pass
+
+def iniciar_servidor():
+    port = int(os.environ.get("PORT", 8081))
+    HTTPServer(("0.0.0.0", port), PingHandler).serve_forever()
+
+def main():
+    global total_sinais
+    print("=" * 55)
+    print("  LIFEFINANCE TOURNAMENT BOT v2.0")
+    print("  Analise MultiTimeframe: M5 M15 M30 H1 H4")
+    print("  MACD: 20,36,10")
+    print("=" * 55)
+
+    threading.Thread(target=iniciar_servidor, daemon=True).start()
+
+    enviar(
+        "LIFEFINANCE BOT v2.0 Online!\n"
+        "-----------------------\n"
+        "Analise MultiTimeframe\n"
+        "M5 M15 M30 H1 H4\n"
+        "MACD configurado 20,36,10\n"
+        "-----------------------\n"
+        "80% -> 85% -> 90% -> 95%\n\n"
+        "/ajuda para ver comandos")
+
+    while True:
+        try: processar_comandos()
+        except Exception as e: print(f"Erro cmd: {e}")
+
+        if not CONFIG["pausado"]:
+            for par in CONFIG["pares_ativos"]:
+                if not deve_verificar(par): continue
+                print(f"[{agora_brt()}] Analisando MTF: {par}")
+                try:
+                    sinal = analisar_par_mtf(par)
+                except Exception as e:
+                    print(f"Erro {par}: {e}"); continue
+
+                if not sinal: continue
+                if not passar_filtros(sinal): continue
+
+                # Verificar calendario economico
+                noticias = buscar_noticias_impacto()
+                bloqueado, noticia = par_afetado_por_noticia(sinal["par"], noticias)
+                if bloqueado:
+                    print(f"  >> BLOQUEADO {sinal['par']} - noticia: {noticia['titulo'][:30]}")
+                    enviar(
+                        f"BLOQUEADO por noticia\n"
+                        f"-----------------------\n"
+                        f"Par: {sinal['par']}\n"
+                        f"Noticia: {noticia['titulo'][:50]}\n"
+                        f"Moeda: {noticia['moeda']}\n"
+                        f"Horario: {noticia['horario']}\n"
+                        f"Aguardando 40min apos noticia...")
+                    continue
+
+                chave = f"{sinal['par']}_{sinal['direcao']}_{sinal['horario']}"
+                if chave in sinais_enviados: continue
+                sinais_enviados[chave] = True
+                total_sinais += 1
+                historico_sinais.append(sinal)
+
+                at_txt = " ATENCAO RSI!" if sinal["atencao"] else ""
+                print(f"  >> {sinal['direcao']} {sinal['par']} "
+                      f"{sinal['prob']}% TFs:{sinal['n_tfs']}"
+                      f"{'F' if sinal['forca'] else ''}{at_txt}")
+                enviar(formatar(sinal))
+
+                # Abrir trade na conta demo automaticamente
+                demo = carregar_demo()
+                if demo:
+                    demo, msg_demo = abrir_trade_demo(demo, sinal)
+                    enviar(msg_demo)
+
+                time.sleep(1)
+
+        # Monitorar trades demo abertos
+        demo = carregar_demo()
+        if demo and demo["trades_abertos"]:
+            demo, msgs = monitorar_trades_demo(demo)
+            for m in msgs:
+                enviar(m)
+
+        time.sleep(5)
+
+if __name__ == "__main__":
+    while True:
+        try: main()
+        except Exception as e: print(f"Erro: {e}"); time.sleep(30)
+
+# ============================================================
