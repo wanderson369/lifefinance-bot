@@ -1042,7 +1042,8 @@ def processar_comandos():
                 linhas = [f"Trades Abertos ({n})"]
                 for tid, t in demo["trades_abertos"].items():
                     sp = "+" if t["pl_pips"] >= 0 else ""
-                    be_txt = "Movido" if t["be_movido"] else f"em {t['pips_be']}p"
+                    be_pips = t["pips_be"]
+                    be_txt = "Movido" if t["be_movido"] else "em " + str(be_pips) + "p"
                     linhas.append(
                         f"{t['direcao']} {t['par']} {t['tf'].upper()}\n"
                         f"  Entry:{t['preco_entry']:.5f} SL:{t['sl']:.5f} TP:{t['tp']:.5f}\n"
